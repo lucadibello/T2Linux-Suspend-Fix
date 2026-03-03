@@ -121,6 +121,8 @@ if [ "$MODE" = "uninstall" ]; then
     sudo rm -f /usr/local/bin/t2-wait-apple-bce.sh
     sudo rm -f /usr/local/bin/t2-wait-brcmfmac.sh
     sudo rm -f /usr/local/bin/fix-kbd-backlight.sh
+    sudo rm -f /usr/local/bin/t2-stop-audio.sh
+    sudo rm -f /usr/local/bin/t2-start-audio.sh
     sudo rm -f /usr/lib/systemd/system-sleep/t2-resync
     sudo rm -f /usr/lib/systemd/system-sleep/90-t2-hibernate-test-brcmfmac.sh
     echo "  - Unit files and scripts removed."
@@ -341,6 +343,41 @@ EOF
 sudo chmod +x /usr/local/bin/t2-wait-apple-bce.sh
 echo -e "${GREEN}Done${NC}"
 
+# Create audio stop/start helper scripts
+echo -e "\n${YELLOW}⚙${NC} Creating audio stop/start helper scripts..."
+sudo tee /usr/local/bin/t2-stop-audio.sh > /dev/null << 'AUDIOEOF'
+#!/bin/sh
+# Stop PipeWire audio session before BCE module removal.
+# Prevents kernel panic caused by stale PCM handles after force-removal.
+uid=$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $3}' | head -n1)
+[ -z "$uid" ] && exit 0
+[ -S "/run/user/$uid/bus" ] || exit 0
+username=$(id -nu "$uid" 2>/dev/null) || exit 0
+XDG_RUNTIME_DIR="/run/user/$uid" \
+DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+    runuser -u "$username" -- \
+    systemctl --user stop pipewire.socket pipewire-pulse.socket \
+        pipewire.service pipewire-pulse.service wireplumber.service 2>/dev/null
+exit 0
+AUDIOEOF
+sudo chmod +x /usr/local/bin/t2-stop-audio.sh
+
+sudo tee /usr/local/bin/t2-start-audio.sh > /dev/null << 'AUDIOEOF'
+#!/bin/sh
+# Restart PipeWire audio session after BCE reload on resume.
+uid=$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $3}' | head -n1)
+[ -z "$uid" ] && exit 0
+[ -S "/run/user/$uid/bus" ] || exit 0
+username=$(id -nu "$uid" 2>/dev/null) || exit 0
+XDG_RUNTIME_DIR="/run/user/$uid" \
+DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+    runuser -u "$username" -- \
+    systemctl --user start pipewire.socket pipewire-pulse.socket 2>/dev/null
+exit 0
+AUDIOEOF
+sudo chmod +x /usr/local/bin/t2-start-audio.sh
+echo -e "${GREEN}Done${NC}"
+
 # Create WiFi unload service
 echo -e "\n${YELLOW}⚙${NC} Creating WiFi unload service..."
 sudo tee /etc/systemd/system/suspend-wifi-unload.service > /dev/null << EOF
@@ -354,12 +391,16 @@ User=root
 Type=oneshot
 # 1. Backlight off before suspend
 ExecStartPre=-/usr/bin/brightnessctl -sd :white:kbd_backlight set 0 -q
-# 2. Deactivate WiFi interface
+# 2. Try to force deep sleep for better T2 resume stability
+ExecStartPre=-/bin/sh -c 'echo deep > /sys/power/mem_sleep'
+# 3. Stop audio session to release apple-bce handles before module removal (prevents kernel panic)
+ExecStart=-/usr/local/bin/t2-stop-audio.sh
+# 4. Deactivate WiFi interface
 ExecStart=-/usr/bin/nmcli radio wifi off
-# 3. Unload WiFi plugin and driver
+# 5. Unload WiFi plugin and driver
 ExecStart=-/usr/sbin/modprobe -r brcmfmac_wcc
 ExecStart=-/usr/sbin/modprobe -r brcmfmac
-# 4. Apple BCE removal
+# 6. Apple BCE removal
 ExecStart=-/usr/sbin/rmmod -f apple-bce
 
 [Install]
@@ -384,11 +425,13 @@ ExecStart=/usr/local/bin/t2-wait-apple-bce.sh
 # 3. Load WiFi driver and plugin
 ExecStart=/usr/sbin/modprobe brcmfmac
 ExecStart=/usr/sbin/modprobe brcmfmac_wcc
-# 4. Restore keyboard backlight on resume
+# 4. Restart audio session after BCE reload
+ExecStartPost=-/usr/local/bin/t2-start-audio.sh
+# 5. Restore keyboard backlight on resume
 ExecStartPost=-/usr/local/bin/fix-kbd-backlight.sh
-# 5. Final WiFi check (after 5s) and retry modprobe if needed
+# 6. Final WiFi check (after 5s) and retry modprobe if needed
 ExecStartPost=/bin/sh -c 'sleep 5; if ! ls /sys/bus/pci/drivers/brcmfmac/*:* >/dev/null 2>&1; then modprobe -r brcmfmac 2>/dev/null || true; modprobe brcmfmac 2>/dev/null || true; modprobe brcmfmac_wcc 2>/dev/null || true; fi'
-# 5. Activate WiFi again
+# 7. Activate WiFi again
 ExecStartPost=-/usr/bin/nmcli radio wifi on
 
 [Install]
