@@ -47,7 +47,7 @@ The crash is a **use-of-stale-MMIO** in the `apple-bce` audio driver:
 2. Force-removal bypasses the driver refcount and taints the kernel `[R]=FORCED_RMMOD`
 3. On resume, `modprobe apple-bce` maps BCE audio at a **new MMIO address**
 4. PipeWire still holds old `snd_pcm` handles pointing to the **old address**
-5. When PipeWire eventually accesses one of those handles → `iowrite32` on an unmapped page → kernel BUG
+5. When PipeWire eventually accesses one of those handles -> `iowrite32` on an unmapped page -> kernel BUG
 
 ```
 RIP: iowrite32
@@ -60,7 +60,7 @@ Process: pipewire (UID 1000)
 Tainted: [R]=FORCED_RMMOD [C]=CRAP (staging driver)
 ```
 
-**Fix:** stop PipeWire _before_ removing `apple-bce`, and restart it _after_ the module reloads on resume.
+To fix the issue, we can simply stop PipeWire *before* removing `apple-bce`, and restart it *after* the module reloads on resume.
 
 ### Thunderbolt xHCI (06:00.0) error on resume
 
@@ -97,7 +97,7 @@ Running `t2-suspend-fix.sh` and choosing **Install** performs:
 ```text
 1. brightnessctl: keyboard backlight off
 2. echo deep > /sys/power/mem_sleep  (override Apple EFI cmdline)
-3. t2-stop-audio.sh                  (stop PipeWire — prevents stale MMIO crash)
+3. t2-stop-audio.sh                  (stop PipeWire to prevent the stale MMIO crash)
 4. nmcli radio wifi off
 5. modprobe -r brcmfmac_wcc
 6. modprobe -r brcmfmac
@@ -149,7 +149,7 @@ Run the script again and choose **Uninstall**. All services, scripts, and system
 
 ## Known Issues
 
-- **Some systems do not work** with this fix. Results vary across firmware revisions even on identical hardware. If it doesn't work, uninstall and revert.
+- **Some systems still do not work** with this fix. Results vary across firmware revisions even on identical hardware. If it doesn't work, uninstall and revert.
 - **Thunderbolt devices** (USB-C peripherals via TB3) may need to be re-plugged after resume due to the JHL7540 -19 ENODEV error.
 
 ---
@@ -166,10 +166,6 @@ chmod +x debug-suspend.sh
 Log paths are printed at the end of each run. Include both logs when reporting issues.
 
 ---
-
-## Contributing
-
-Yes please!
 
 ## License
 
