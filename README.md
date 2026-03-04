@@ -175,4 +175,4 @@ Yes please!
 
 Use at your own risk.
 
-> Thank you very much @deqrocks. I built on top of your work to create a more comprehensive fix that targets also my specific firmware/machine. I hope this will be useful to other T2 Linux users as well. If you have any suggestions or improvements, please let me know! 🙌
+> Thank you very much [@deqrocks](https://github.com/deqrocks). I built on top of your work to create a more comprehensive fix that targets also my specific firmware/machine. I hope this will be useful to other T2 Linux users as well. If you have any suggestions or improvements, please let me know! 🙌
