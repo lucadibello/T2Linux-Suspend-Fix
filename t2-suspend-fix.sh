@@ -333,7 +333,7 @@ for i in $(seq 1 30); do
 done
 logger -t t2-suspend-fix "$msg"
 if command -v notify-send >/dev/null 2>&1; then
-    uid=$(loginctl list-sessions --no-legend | awk '{print $3}' | head -n1)
+    uid=$(loginctl list-sessions --no-legend | awk '{print $2}' | head -n1)
     if [ -n "$uid" ] && [ -S "/run/user/$uid/bus" ]; then
         XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" sudo -u "#$uid" notify-send "Suspend Fix" "$msg"
     fi
@@ -349,7 +349,7 @@ sudo tee /usr/local/bin/t2-stop-audio.sh > /dev/null << 'AUDIOEOF'
 #!/bin/sh
 # Stop PipeWire audio session before BCE module removal.
 # Prevents kernel panic caused by stale PCM handles after force-removal.
-uid=$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $3}' | head -n1)
+uid=$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $2}' | head -n1)
 [ -z "$uid" ] && exit 0
 [ -S "/run/user/$uid/bus" ] || exit 0
 username=$(id -nu "$uid" 2>/dev/null) || exit 0
@@ -365,7 +365,7 @@ sudo chmod +x /usr/local/bin/t2-stop-audio.sh
 sudo tee /usr/local/bin/t2-start-audio.sh > /dev/null << 'AUDIOEOF'
 #!/bin/sh
 # Restart PipeWire audio session after BCE reload on resume.
-uid=$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $3}' | head -n1)
+uid=$(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $2}' | head -n1)
 [ -z "$uid" ] && exit 0
 [ -S "/run/user/$uid/bus" ] || exit 0
 username=$(id -nu "$uid" 2>/dev/null) || exit 0
