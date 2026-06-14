@@ -36,6 +36,10 @@ echo "=== Sleep Mode ==="
 cat /sys/power/mem_sleep
 echo ""
 
+echo "=== ACPI Wakeup Sources ==="
+cat /proc/acpi/wakeup
+echo ""
+
 echo "=== WiFi Hardware ==="
 lspci -nn | grep -i broadcom
 echo ""

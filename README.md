@@ -39,6 +39,22 @@ As we all know, this fix might not work on every T2 MacBook due to firmware diff
 
 ## Root Cause Analysis
 
+### Why the system immediately wakes from S3 (kernel 7.0+)
+
+In kernel 7.0+, PCIe devices left without a driver after `rmmod`/`modprobe -r` are no longer automatically put into D3 before S3 sleep. This means the **T2 BCE devices** (at `02:00.1`/`02:00.3`, rooted at `RP09 00:1d.0`) and the **BCM4377b WiFi hardware** (`01:00.0`, rooted at `RP01 00:1c.0` / `ARPT`) can send **PME (Power Management Events)** almost immediately after the system enters S3, causing a spurious wakeup within seconds. The **Thunderbolt xHCI** (`XHC2 06:00.0` / `RP05 00:1c.4`) already fails on every resume and is a third source.
+
+The fix adds a step to the suspend service that **disables these ACPI wakeup sources** (`RP09`, `RP01`, `ARPT`, `RP05`, `XHC2`) just before sleep, and re-enables them as the first step on resume. On T2 Macs the keyboard/trackpad wakeup is handled by the T2 chip's firmware through ACPI independently of these PCIe entries, so lid-open and key-press wakeup still work.
+
+PCIe layout relevant to this fix:
+
+```
+00:1c.0  RP01  → 01:00.0 BCM4377b WiFi (ARPT) + 01:00.1 Bluetooth
+00:1c.4  RP05  → Thunderbolt complex → 06:00.0 XHC2 (Thunderbolt xHCI)
+00:1d.0  RP09  → 02:00.0 NVMe / 02:00.1 T2 BCE / 02:00.2 Enclave / 02:00.3 Audio
+```
+
+---
+
 ### Why suspend crashes (kernel panic on resume)
 
 The crash is a **use-of-stale-MMIO** in the `apple-bce` audio driver:
@@ -102,12 +118,14 @@ Running `t2-suspend-fix.sh` and choosing **Install** performs:
 5. modprobe -r brcmfmac_wcc
 6. modprobe -r brcmfmac
 7. rmmod -f apple-bce
+8. disable ACPI S3 wakeup for RP09, RP01, ARPT, RP05, XHC2 (prevent spurious PME wakeup)
 -> system suspends
 ```
 
 ### After resume (`resume-wifi-reload.service`)
 
 ```text
+0. re-enable ACPI S3 wakeup for RP09, RP01, ARPT, RP05, XHC2
 1. modprobe apple-bce
 2. t2-wait-apple-bce.sh              (polls up to 15s; aborts with notification if missing)
 3. modprobe brcmfmac

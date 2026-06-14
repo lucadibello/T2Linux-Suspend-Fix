@@ -10,7 +10,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
-VERSION="1.5.0"
+VERSION="1.6.0"
 
 BACKUP_DIR="/etc/t2-suspend-fix"
 THERMALD_STATE_FILE="${BACKUP_DIR}/thermald_enabled"
@@ -402,6 +402,10 @@ ExecStart=-/usr/sbin/modprobe -r brcmfmac_wcc
 ExecStart=-/usr/sbin/modprobe -r brcmfmac
 # 6. Apple BCE removal
 ExecStart=-/usr/sbin/rmmod -f apple-bce
+# 7. Disable PCIe wakeup sources that send spurious PME when left driverless (kernel 7.0+):
+#    RP09 (T2 root port), RP01+ARPT (WiFi root port + device),
+#    RP05+XHC2 (Thunderbolt root port + xHCI - fails on every resume)
+ExecStart=-/bin/sh -c 'for dev in RP09 RP01 ARPT RP05 XHC2; do grep -q "^\${dev}[[:space:]].*\*enabled" /proc/acpi/wakeup && echo "\$dev" > /proc/acpi/wakeup || true; done'
 
 [Install]
 WantedBy=sleep.target
@@ -418,6 +422,8 @@ After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate
 [Service]
 User=root
 Type=oneshot
+# 0. Re-enable PCIe wakeup sources that were disabled before sleep
+ExecStart=-/bin/sh -c 'for dev in RP09 RP01 ARPT RP05 XHC2; do grep -q "^\${dev}[[:space:]].*\*disabled" /proc/acpi/wakeup && echo "\$dev" > /proc/acpi/wakeup || true; done'
 # 1. Load BCE first
 ExecStart=/usr/sbin/modprobe apple-bce
 # 2. Wait for BCE to initialize (up to 15s, then fail with message)
