@@ -10,7 +10,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
-VERSION="1.6.0"
+VERSION="1.8.0"
 
 BACKUP_DIR="/etc/t2-suspend-fix"
 THERMALD_STATE_FILE="${BACKUP_DIR}/thermald_enabled"
@@ -123,8 +123,11 @@ if [ "$MODE" = "uninstall" ]; then
     sudo rm -f /usr/local/bin/fix-kbd-backlight.sh
     sudo rm -f /usr/local/bin/t2-stop-audio.sh
     sudo rm -f /usr/local/bin/t2-start-audio.sh
+    sudo rm -f /usr/local/bin/t2-disable-pcie-wakeup.sh
+    sudo rm -f /usr/local/bin/t2-enable-pcie-wakeup.sh
     sudo rm -f /usr/lib/systemd/system-sleep/t2-resync
     sudo rm -f /usr/lib/systemd/system-sleep/90-t2-hibernate-test-brcmfmac.sh
+    sudo rm -f /usr/lib/systemd/system-sleep/zzz-t2-force-deep.sh
     echo "  - Unit files and scripts removed."
 
     # Restore override.conf if backed up
@@ -173,6 +176,16 @@ if [ "$MODE" = "uninstall" ]; then
         fi
     else
         echo "  - No thermald state file found. Skipping."
+    fi
+
+    # Restore TLP config if backed up
+    TLP_BACKUP="${BACKUP_DIR}/tlp.conf.bak"
+    if [ -f "$TLP_BACKUP" ]; then
+        echo "  - Restoring TLP config..."
+        sudo cp "$TLP_BACKUP" /etc/tlp.conf
+        echo "  - TLP config restored."
+    else
+        echo "  - No TLP backup found. Skipping."
     fi
 
     # Restore ACPI wake sources
@@ -255,6 +268,9 @@ sudo rm -f /etc/systemd/system/fix-kbd-backlight.service
 sudo rm -f /etc/systemd/system/suspend-fix-t2.service
 sudo rm -f /usr/lib/systemd/system-sleep/t2-resync
 sudo rm -f /usr/lib/systemd/system-sleep/90-t2-hibernate-test-brcmfmac.sh
+sudo rm -f /usr/lib/systemd/system-sleep/zzz-t2-force-deep.sh
+sudo rm -f /usr/local/bin/t2-disable-pcie-wakeup.sh
+sudo rm -f /usr/local/bin/t2-enable-pcie-wakeup.sh
 echo "  - Old unit files removed."
 
 # Enable all S3 wake sources (backup current state first)
@@ -358,6 +374,18 @@ DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
     runuser -u "$username" -- \
     systemctl --user stop pipewire.socket pipewire-pulse.socket \
         pipewire.service pipewire-pulse.service wireplumber.service 2>/dev/null
+
+# Kill any remaining processes holding aaudio PCM devices.
+# This prevents the 'BUG: scheduling while atomic' crash in
+# aaudio_handle_stream_timestamp when rmmod -f apple-bce tears down
+# the module while the BCE DMA IRQ thread is still processing T2
+# audio timestamp events.
+if command -v fuser >/dev/null 2>&1; then
+    fuser -k /dev/snd/controlC0 /dev/snd/pcmC0* 2>/dev/null || true
+fi
+# Brief pause so the DMA IRQ thread can drain its current transaction
+# before BCE module removal.
+sleep 0.5
 exit 0
 AUDIOEOF
 sudo chmod +x /usr/local/bin/t2-stop-audio.sh
@@ -376,6 +404,39 @@ DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
 exit 0
 AUDIOEOF
 sudo chmod +x /usr/local/bin/t2-start-audio.sh
+echo -e "${GREEN}Done${NC}"
+
+# Create PCIe wakeup disable/enable helper scripts
+echo -e "\n${YELLOW}⚙${NC} Creating PCIe wakeup helper scripts..."
+sudo tee /usr/local/bin/t2-disable-pcie-wakeup.sh > /dev/null << 'WAKEEOF'
+#!/bin/sh
+# Disable ACPI S3 wakeup for PCIe/USB devices that send spurious wakeup
+# signals on this T2 MacBook. Without this the system wakes from S3 within
+# seconds of entering sleep.
+#
+# Devices disabled:
+#   RP09 (00:1d.0) - T2 root port (NVMe, BCE, Enclave, Audio) - BCE removed before sleep
+#   RP01 (00:1c.0) - WiFi root port                           \
+#   ARPT (01:00.0) - BCM4377b WiFi device                      } driver removed before sleep
+#   RP05 (00:1c.4) - Thunderbolt root port                    \
+#   XHC2 (06:00.0) - Thunderbolt xHCI (fails on every resume)  } known PME source
+#   XHC1 (00:14.0) - Intel PCH USB: T2 appears here as USB device, sends wakeup ~10s after S3
+#
+# /proc/acpi/wakeup is a toggle: writing a device name flips its state.
+for dev in RP09 RP01 ARPT RP05 XHC2 XHC1; do
+    grep -q "^${dev}[[:space:]].*\*enabled" /proc/acpi/wakeup && echo "$dev" > /proc/acpi/wakeup || true
+done
+WAKEEOF
+sudo chmod +x /usr/local/bin/t2-disable-pcie-wakeup.sh
+
+sudo tee /usr/local/bin/t2-enable-pcie-wakeup.sh > /dev/null << 'WAKEEOF'
+#!/bin/sh
+# Re-enable ACPI S3 wakeup sources that were disabled before sleep.
+for dev in RP09 RP01 ARPT RP05 XHC2 XHC1; do
+    grep -q "^${dev}[[:space:]].*\*disabled" /proc/acpi/wakeup && echo "$dev" > /proc/acpi/wakeup || true
+done
+WAKEEOF
+sudo chmod +x /usr/local/bin/t2-enable-pcie-wakeup.sh
 echo -e "${GREEN}Done${NC}"
 
 # Create WiFi unload service
@@ -400,12 +461,11 @@ ExecStart=-/usr/bin/nmcli radio wifi off
 # 5. Unload WiFi plugin and driver
 ExecStart=-/usr/sbin/modprobe -r brcmfmac_wcc
 ExecStart=-/usr/sbin/modprobe -r brcmfmac
-# 6. Apple BCE removal
-ExecStart=-/usr/sbin/rmmod -f apple-bce
-# 7. Disable PCIe wakeup sources that send spurious PME when left driverless (kernel 7.0+):
-#    RP09 (T2 root port), RP01+ARPT (WiFi root port + device),
-#    RP05+XHC2 (Thunderbolt root port + xHCI - fails on every resume)
-ExecStart=-/bin/sh -c 'for dev in RP09 RP01 ARPT RP05 XHC2; do grep -q "^\${dev}[[:space:]].*\*enabled" /proc/acpi/wakeup && echo "\$dev" > /proc/acpi/wakeup || true; done'
+# 6. Apple BCE removal: try clean removal first, force only if busy
+ExecStart=-/bin/sh -c 'modprobe -r apple-bce 2>/dev/null || rmmod -f apple-bce 2>/dev/null || true'
+# 7. Disable PCIe wakeup sources that send spurious PME in kernel 7.0+
+#    (T2 root port, WiFi root port+device, Thunderbolt root port+xHCI)
+ExecStart=-/usr/local/bin/t2-disable-pcie-wakeup.sh
 
 [Install]
 WantedBy=sleep.target
@@ -423,7 +483,7 @@ After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate
 User=root
 Type=oneshot
 # 0. Re-enable PCIe wakeup sources that were disabled before sleep
-ExecStart=-/bin/sh -c 'for dev in RP09 RP01 ARPT RP05 XHC2; do grep -q "^\${dev}[[:space:]].*\*disabled" /proc/acpi/wakeup && echo "\$dev" > /proc/acpi/wakeup || true; done'
+ExecStart=-/usr/local/bin/t2-enable-pcie-wakeup.sh
 # 1. Load BCE first
 ExecStart=/usr/sbin/modprobe apple-bce
 # 2. Wait for BCE to initialize (up to 15s, then fail with message)
@@ -534,6 +594,46 @@ else
     echo "enabled=0" | sudo tee "$THERMALD_STATE_FILE" > /dev/null
     echo -e "${GREEN}thermald not found or not enabled${NC}"
 fi
+
+# Configure TLP to use deep sleep (it overrides mem_sleep to s2idle otherwise)
+echo -e "\n${YELLOW}⚙${NC} Checking TLP sleep mode..."
+TLP_CONF="/etc/tlp.conf"
+if [ -f "$TLP_CONF" ]; then
+    TLP_BACKUP="${BACKUP_DIR}/tlp.conf.bak"
+    if [ ! -f "$TLP_BACKUP" ]; then
+        sudo mkdir -p "$BACKUP_DIR"
+        sudo cp "$TLP_CONF" "$TLP_BACKUP"
+        echo "  - Backed up TLP config to $TLP_BACKUP"
+    fi
+    # Uncomment and set deep for both AC and battery.
+    # TLP's system-sleep hook writes MEM_SLEEP_ON_AC/BAT to /sys/power/mem_sleep
+    # *after* our suspend-wifi-unload.service runs, so we must fix it at the source.
+    if grep -qE '^#?MEM_SLEEP_ON_AC=' "$TLP_CONF"; then
+        sudo sed -i 's/^#\?MEM_SLEEP_ON_AC=.*/MEM_SLEEP_ON_AC="deep"/' "$TLP_CONF"
+    else
+        echo 'MEM_SLEEP_ON_AC="deep"' | sudo tee -a "$TLP_CONF" > /dev/null
+    fi
+    if grep -qE '^#?MEM_SLEEP_ON_BAT=' "$TLP_CONF"; then
+        sudo sed -i 's/^#\?MEM_SLEEP_ON_BAT=.*/MEM_SLEEP_ON_BAT="deep"/' "$TLP_CONF"
+    else
+        echo 'MEM_SLEEP_ON_BAT="deep"' | sudo tee -a "$TLP_CONF" > /dev/null
+    fi
+    echo -e "${GREEN}TLP sleep mode set to deep${NC}"
+else
+    echo -e "${GREEN}TLP not found or not configured${NC}"
+fi
+
+# Install system-sleep hook that forces deep sleep last (runs after TLP's hook)
+echo -e "\n${YELLOW}⚙${NC} Installing deep-sleep enforcement hook..."
+sudo tee /usr/lib/systemd/system-sleep/zzz-t2-force-deep.sh > /dev/null << 'SLEEPEOF'
+#!/bin/sh
+# Ensure S3 deep sleep is active at suspend time.
+# Named zzz-* so it runs after TLP's system-sleep hook and overrides any
+# s2idle setting TLP may have applied.
+[ "$1" = "pre" ] && echo deep > /sys/power/mem_sleep || true
+SLEEPEOF
+sudo chmod +x /usr/lib/systemd/system-sleep/zzz-t2-force-deep.sh
+echo -e "${GREEN}Done${NC}"
 
 # Set ASPM to off
 echo -e "\n${YELLOW}⚙${NC} Setting ASPM to off..."
