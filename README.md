@@ -43,11 +43,12 @@ As we all know, this fix might not work on every T2 MacBook due to firmware diff
 
 In kernel 7.0+, PCIe devices left without a driver after `rmmod`/`modprobe -r` are no longer automatically put into D3 before S3 sleep. This means the **T2 BCE devices** (at `02:00.1`/`02:00.3`, rooted at `RP09 00:1d.0`) and the **BCM4377b WiFi hardware** (`01:00.0`, rooted at `RP01 00:1c.0` / `ARPT`) can send **PME (Power Management Events)** almost immediately after the system enters S3, causing a spurious wakeup within seconds. The **Thunderbolt xHCI** (`XHC2 06:00.0` / `RP05 00:1c.4`) already fails on every resume and is a third source.
 
-The fix adds a step to the suspend service that **disables these ACPI wakeup sources** (`RP09`, `RP01`, `ARPT`, `RP05`, `XHC2`) just before sleep, and re-enables them as the first step on resume. On T2 Macs the keyboard/trackpad wakeup is handled by the T2 chip's firmware through ACPI independently of these PCIe entries, so lid-open and key-press wakeup still work.
+The fix adds a step to the suspend service that **disables these ACPI wakeup sources** (`RP09`, `RP01`, `ARPT`, `RP05`, `XHC2`, `XHC1`) just before sleep, and re-enables them as the first step on resume. On T2 Macs the keyboard/trackpad wakeup is handled by the T2 chip's firmware through ACPI independently of these PCIe entries, so lid-open and key-press wakeup still work.
 
 PCIe layout relevant to this fix:
 
 ```
+00:14.0  XHC1  → Intel PCH USB — T2 appears here as a USB device; sends wakeup ~10s after S3
 00:1c.0  RP01  → 01:00.0 BCM4377b WiFi (ARPT) + 01:00.1 Bluetooth
 00:1c.4  RP05  → Thunderbolt complex → 06:00.0 XHC2 (Thunderbolt xHCI)
 00:1d.0  RP09  → 02:00.0 NVMe / 02:00.1 T2 BCE / 02:00.2 Enclave / 02:00.3 Audio
@@ -101,8 +102,10 @@ Running `t2-suspend-fix.sh` and choosing **Install** performs:
 4. **Sets `mem_sleep_default=deep`** via grubby (Fedora) or GRUB config (Debian/Arch)
 5. **Sets `pcie_aspm=off`** kernel parameter
 6. **Disables thermald** if present (interferes with suspend)
-7. **Removes `systemd-suspend` override.conf** if present
-8. **Installs libnotify** if missing (for desktop notifications on resume failure)
+7. **Configures TLP** to use `deep` sleep instead of `s2idle` (if installed)
+8. **Installs `zzz-t2-force-deep.sh`** system-sleep hook as a belt-and-suspenders guarantee that `mem_sleep` is `deep` even if TLP or another tool overrides it
+9. **Removes `systemd-suspend` override.conf** if present
+10. **Installs libnotify** if missing (for desktop notifications on resume failure)
 
 ---
 
@@ -118,14 +121,14 @@ Running `t2-suspend-fix.sh` and choosing **Install** performs:
 5. modprobe -r brcmfmac_wcc
 6. modprobe -r brcmfmac
 7. rmmod -f apple-bce
-8. disable ACPI S3 wakeup for RP09, RP01, ARPT, RP05, XHC2 (prevent spurious PME wakeup)
+8. disable ACPI S3 wakeup for RP09, RP01, ARPT, RP05, XHC2, XHC1 (prevent spurious PME/USB wakeup)
 -> system suspends
 ```
 
 ### After resume (`resume-wifi-reload.service`)
 
 ```text
-0. re-enable ACPI S3 wakeup for RP09, RP01, ARPT, RP05, XHC2
+0. re-enable ACPI S3 wakeup for RP09, RP01, ARPT, RP05, XHC2, XHC1
 1. modprobe apple-bce
 2. t2-wait-apple-bce.sh              (polls up to 15s; aborts with notification if missing)
 3. modprobe brcmfmac
@@ -144,6 +147,36 @@ Running `t2-suspend-fix.sh` and choosing **Install** performs:
 | `/usr/local/bin/t2-start-audio.sh`    | Restarts `pipewire.socket` and `pipewire-pulse.socket`                        |
 | `/usr/local/bin/t2-wait-apple-bce.sh` | Polls for BCE driver readiness; sends desktop notification on timeout         |
 | `/usr/local/bin/fix-kbd-backlight.sh` | Restores keyboard backlight; reloads BCE if the backlight path is missing     |
+
+---
+
+## Additional Fix Scripts
+
+These standalone scripts address issues that are independent of the suspend/resume cycle. Run them once after installing the main fix.
+
+### `fix-t2-ncm.sh` — Stop the top-bar loading spinner after resume
+
+**Problem:** After every resume, GNOME shows a persistent loading animation in the top bar for ~90 seconds. This is caused by NetworkManager repeatedly trying to obtain a DHCP lease on `t2_ncm` — a virtual USB Ethernet interface the T2 chip exposes internally. There is no DHCP server behind it; the interface is an Apple-internal management channel, not a real network connection.
+
+**Fix:** Adds `/etc/NetworkManager/conf.d/t2-unmanaged.conf` to mark `t2_ncm` as unmanaged, preventing NetworkManager from touching it.
+
+```bash
+bash fix-t2-ncm.sh
+```
+
+---
+
+### `fix-t2-bluetooth.sh` — Fix intermittent Bluetooth not detected at boot
+
+**Problem:** On some boots the Bluetooth adapter is completely invisible. The `hci_bcm4377` driver logs `probe with driver hci_bcm4377 failed with error -110` (`-ETIMEDOUT`). The BCM4377 chip exposes WiFi (`01:00.0`, `brcmfmac`) and Bluetooth (`01:00.1`, `hci_bcm4377`) as two PCIe functions that share the same firmware. If `hci_bcm4377` probes `01:00.1` while `brcmfmac` is still loading the shared firmware, the probe times out and the Bluetooth card is invisible until reboot.
+
+**Fix:** Two-part:
+1. `/etc/modprobe.d/t2-bluetooth.conf` — `softdep hci_bcm4377 pre: brcmfmac` ensures the WiFi driver loads first.
+2. `/etc/udev/rules.d/99-t2-bluetooth.rules` — re-probes `0000:01:00.1` and unblocks rfkill the moment the WiFi interface (`wlp*`) appears, guaranteeing `brcmfmac` has fully initialized its firmware before `hci_bcm4377` binds.
+
+```bash
+bash fix-t2-bluetooth.sh
+```
 
 ---
 
