@@ -46,6 +46,17 @@ HELPER=/usr/local/bin/t2-touchbar-fix.sh
 SERVICE=/etc/systemd/system/t2-touchbar-fix.service
 RESUME_SERVICE=/etc/systemd/system/t2-touchbar-resume.service
 POWER_RULE=/etc/udev/rules.d/99-t2-touchbar-power.rules
+TINYDFR_CONF=/etc/tiny-dfr/config.toml
+
+# tiny-dfr's adaptive brightness maps the main screen's brightness onto the Touch
+# Bar backlight using a value on a 0-255 scale, but the Intel T2 Touch Bar
+# (hid-appletb-bl) only has 3 levels (max_brightness=2). With the default
+# ActiveBrightness=128 the computed value saturates to 2 at almost any screen
+# brightness, so the bar is always at full and never tracks the screen. Scaling
+# ActiveBrightness right down brings the output into the usable {1,2} range so it
+# actually dims. The dim->bright crossover sits at ~509/ActiveBrightness^2 percent
+# of screen brightness; 4 -> ~32%. Raise it to dim later, lower it to dim sooner.
+ACTIVE_BRIGHTNESS=4
 
 # Remove stale artifacts from earlier (incorrect) attempts.
 for f in /etc/modprobe.d/t2-touchbar.conf \
@@ -66,6 +77,23 @@ sudo tee "$POWER_RULE" > /dev/null << 'EOF'
 SUBSYSTEM=="usb", ATTR{idVendor}=="05ac", ATTR{idProduct}=="8302", ATTR{power/control}="on", ATTR{power/autosuspend_delay_ms}="-1"
 EOF
 echo -e "${GREEN}Done: $POWER_RULE${NC}"
+
+echo -e "${YELLOW}⚙${NC} Configuring tiny-dfr adaptive brightness: $TINYDFR_CONF"
+if [ -e "$TINYDFR_CONF" ] && [ ! -e "$TINYDFR_CONF.t2bak" ]; then
+    sudo cp "$TINYDFR_CONF" "$TINYDFR_CONF.t2bak"
+    echo -e "${YELLOW}  Backed up existing config to $TINYDFR_CONF.t2bak${NC}"
+fi
+sudo mkdir -p "$(dirname "$TINYDFR_CONF")"
+# tiny-dfr merges /etc over /usr/share, so only the overridden keys are needed.
+sudo tee "$TINYDFR_CONF" > /dev/null << EOF
+# Touch Bar backlight follows the main screen's brightness.
+# ActiveBrightness is scaled down because the Intel T2 Touch Bar backlight only
+# has 3 levels (max_brightness=2); the default 128 would pin it at full.
+# Crossover dim->bright is at ~509/ActiveBrightness^2 % screen brightness.
+AdaptiveBrightness = true
+ActiveBrightness = $ACTIVE_BRIGHTNESS
+EOF
+echo -e "${GREEN}Done: $TINYDFR_CONF${NC}"
 
 echo -e "${YELLOW}⚙${NC} Installing helper script: $HELPER"
 sudo tee "$HELPER" > /dev/null << 'EOF'
@@ -117,11 +145,17 @@ sleep 2
 if [ -n "$TB" ]; then
     echo on > "$TB/power/control" 2>/dev/null
     echo -1 > "$TB/power/autosuspend_delay_ms" 2>/dev/null
-    # Switch into config 2 with delays (writes may report a timeout but take effect).
-    echo 0 > "$TB/bConfigurationValue" 2>/dev/null
-    sleep 1
-    echo 2 > "$TB/bConfigurationValue" 2>/dev/null
-    sleep 3
+    # After a fresh apple_bce reload the device almost always re-enumerates
+    # straight into config 2 and appletbdrm binds on its own. Only force the
+    # config switch if it did NOT — otherwise the extra 0->2 toggle unbinds and
+    # rebinds appletbdrm, which makes the Touch Bar flicker a second time and
+    # churns tiny-dfr (it loses and regains its DRM device).
+    if ! ls -d /sys/bus/usb/drivers/appletbdrm/*:2.* >/dev/null 2>&1; then
+        echo 0 > "$TB/bConfigurationValue" 2>/dev/null
+        sleep 1
+        echo 2 > "$TB/bConfigurationValue" 2>/dev/null
+        sleep 3
+    fi
 fi
 
 modprobe hid_appletb_kbd
@@ -193,6 +227,8 @@ sudo udevadm control --reload-rules
 sudo systemctl daemon-reload
 sudo systemctl enable t2-touchbar-fix.service
 sudo systemctl enable t2-touchbar-resume.service
+# Apply the new brightness config now if tiny-dfr is already running.
+sudo systemctl try-restart tiny-dfr 2>/dev/null
 echo -e "${GREEN}Done.${NC}"
 
 echo ""
